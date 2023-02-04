@@ -1,0 +1,121 @@
+#!/bin/env bash
+# Author: bad3r@hacklog.sh
+# MIT License
+# Copyright (c) 2023 Bad3r
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+set -euo pipefail
+
+if [ "$(id -u)" != "0" ]; then
+   echo "ERROR: This script must be run as root" 1>&2
+   exit 1
+fi
+
+SSD=$1
+
+if [ -z "$SSD" ]; then
+    echo "Error: No NVMe SSD specified."
+    echo "Usage: secure-wipe /dev/nvme0n1"
+    exit 1
+fi
+
+if [ ! -b "$SSD" ]; then
+    echo "Error: $SSD is not a block device."
+    exit 1
+fi
+
+# Ask for confirmation
+printf ":: This will securely wipe the data on %s.\n" "$SSD"
+printf " Are you sure? (y/n): "
+read -r confirmation
+if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+    echo ":: Wipe cancelled."
+    exit 0
+fi
+
+echo ":: Wiping $SSD..."
+
+# Use the Gutmann method
+gutmann_pattern=(
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
+  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff
+)
+
+vol="luks_wipe"
+random_source="/dev/random"
+
+printf ":: Generating a random password..\n"
+random_password="$(head -c 512 < $random_source | tr -dc A-Za-z0-9)"
+printf ":: password: %s\n" "$random_password"
+printf ":: Creating LUKS2 encrypted volume on %s" "$SSD"
+cryptsetup luksFormat --type luks2 --hash sha512 --key-size 512 --iter-time 5000 "$SSD" <<EOF
+$random_password
+$random_password
+EOF
+
+cryptsetup open "$SSD" "$vol" <<EOF
+$random_password
+EOF
+volPath="/dev/mapper/luks_wipe"
+printf ":: Wiping LUKS2 encrypted volume..\n"
+printf ":: Source: %s...\n" "$random_source\n:: "
+
+
+
+# Overwrite the disk multiple times with random data
+for i in $(seq 1 35); do
+  for byte in "${gutmann_pattern[@]}"; do
+  
+    printf ":: Gutmann iteration: %d/35" "$i"
+    dd if="$random_source" bs=12G count=1 seek="$byte" of="$volPath" conv=notrunc,noerror status=progress
+  done
+done
+
+
+echo ":: Closing LUKS2 encrypted volume"
+cryptsetup close $vol
+
+dd if=/dev/zero of="$SSD" bs=12G conv=notrunc,noerror status=progress
+
+
+# Verify the wiped data
+verify_result=$(dd if="$SSD" bs=12G count=1 | hexdump -C | grep -E '[^00]' | wc -l)
+if [ "$verify_result" -ne "0" ]; then
+  echo "Error: Data verification failed."
+  exit 1
+else
+  echo "$SSD securely wiped."
+fi
+
