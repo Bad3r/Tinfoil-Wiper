@@ -27,10 +27,52 @@ media. Tinfoil Wiper follows that guidance.
 * `util-linux` (`lsblk`, `findmnt`, `blockdev`, `blkdiscard`, `wipefs`)
 * `cryptsetup` for the software crypto-erase fallback
 * `coreutils` (`dd`, `tr`, `wc`)
+* `gnugrep` (`grep`) and `gnused` (`sed`)
 
 Only the tools for the method you actually use are required. A dry run makes
 no changes to any device; it still runs read-only tools (`lsblk`, `blockdev`)
 to describe the target and prints the exact commands a real run would execute.
+
+## Nix and NixOS
+
+The flake exposes `packages.<system>.tinfoil-wiper`, a default package and app,
+an overlay, and a NixOS module. Build and test the package directly with:
+
+```bash
+nix build
+nix run . -- --version
+nix flake check
+```
+
+Add it to a flake-based NixOS configuration as an input:
+
+```nix
+inputs.tinfoil-wiper = {
+  url = "github:Bad3r/Tinfoil-Wiper";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Import the module into the target system and enable it:
+
+```nix
+{
+  imports = [ inputs.tinfoil-wiper.nixosModules.default ];
+  programs.tinfoil-wiper.enable = true;
+}
+```
+
+Configurations that own their package options can consume the package directly:
+
+```nix
+environment.systemPackages = [
+  inputs.tinfoil-wiper.packages.${pkgs.stdenv.hostPlatform.system}.tinfoil-wiper
+];
+```
+
+The Nix package wraps a fixed runtime `PATH`, so the declared commands remain
+available after `sudo` applies its secure path. It does not grant privileges:
+real wipes still require an explicit `sudo tinfoil_wiper ...` invocation.
 
 ## Usage
 
@@ -83,8 +125,8 @@ single partition, use `-m crypto` or `-m zero`.
 When no NVMe hardware erase is available, the `crypto` method:
 
 1. Formats the device as LUKS2 with a random key read from `/dev/urandom`. The
-   key is not printed; it is held in a temporary file (on tmpfs such as
-   `/dev/shm` when available) and removed on exit.
+   key is not printed; it is held in a temporary file under `/run` or `/dev/shm`
+   and removed on exit.
 2. Opens the volume and overwrites the entire mapping once, replacing any
    previous plaintext across the visible capacity.
 3. Closes the volume and erases the LUKS header, discarding the key. The
@@ -114,6 +156,7 @@ verification as a sanity check, not a guarantee.
 bash tests/test_tinfoil_wiper.sh   # pure helpers (verification predicate)
 bash tests/test_dryrun.sh          # dry-run dispatch and safety mapping
 shellcheck tinfoil_wiper tests/*.sh
+nix flake check                    # package build, tests, and module evaluation
 ```
 
 ## Notes
