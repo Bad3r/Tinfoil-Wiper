@@ -63,5 +63,29 @@ else
   fail "region_is_zero: unreadable path returns 'unreadable' (2), not zero"
 fi
 
+# Root-sensitive temporary material must never use a caller-controlled runtime
+# directory. Mock mktemp so this test creates no file.
+untrusted_runtime="$tmpdir/user-runtime"
+XDG_RUNTIME_DIR="$untrusted_runtime"
+# shellcheck disable=SC2329
+mktemp() { printf '%s\n' "$1"; }
+export XDG_RUNTIME_DIR
+export -f mktemp
+keyfile=$(create_keyfile); rc=$?
+unset -f mktemp
+unset XDG_RUNTIME_DIR
+if [ "$rc" -eq 0 ]; then
+  case "$keyfile" in
+    /run/tinfoil.XXXXXX | /dev/shm/tinfoil.XXXXXX)
+      ok "create_keyfile: ignores inherited XDG_RUNTIME_DIR"
+      ;;
+    *)
+      fail "create_keyfile: ignores inherited XDG_RUNTIME_DIR (got '$keyfile')"
+      ;;
+  esac
+else
+  fail "create_keyfile: selects a system runtime directory"
+fi
+
 printf '\n%d/%d tests passed\n' "$((tests_run - tests_failed))" "$tests_run"
 [ "$tests_failed" -eq 0 ]

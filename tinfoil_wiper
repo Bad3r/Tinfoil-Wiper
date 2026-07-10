@@ -98,6 +98,16 @@ require_root() {
   [ "$(id -u)" = "0" ] || die "$PROGNAME must be run as root"
 }
 
+create_keyfile() {
+  local dir
+  # A root invocation must not trust XDG_RUNTIME_DIR inherited through sudo.
+  for dir in /run /dev/shm; do
+    [ -d "$dir" ] || continue
+    mktemp "$dir/tinfoil.XXXXXX" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 # --- safety guards --------------------------------------------------------
 
 # device_in_use DEV: true if the device (or any of its partitions/holders)
@@ -265,8 +275,8 @@ crypto_erase() {
     keyfile="<throwaway-key>"
     info "[dry-run] create throwaway random key file (512 bytes from /dev/urandom)"
   else
-    _keyfile=$(mktemp "${XDG_RUNTIME_DIR:-/dev/shm}/tinfoil.XXXXXX" 2>/dev/null ||
-      mktemp)
+    _keyfile=$(create_keyfile) ||
+      die "cannot create a throwaway key file in /run or /dev/shm"
     keyfile="$_keyfile"
     # Raw random bytes as the key; not printed, and removed on exit.
     dd if=/dev/urandom of="$_keyfile" bs=512 count=1 status=none
