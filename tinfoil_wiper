@@ -1,4 +1,4 @@
-#!/bin/env bash
+#!/usr/bin/env bash
 # Author: bad3r@hacklog.sh
 # MIT License
 # Copyright (c) 2023 Bad3r
@@ -21,101 +21,535 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
 set -euo pipefail
 
-if [ "$(id -u)" != "0" ]; then
-   echo "ERROR: This script must be run as root" 1>&2
-   exit 1
-fi
+readonly PROGNAME="tinfoil_wiper"
+readonly VERSION="2.0.0"
 
-SSD=$1
+# --- global state ---------------------------------------------------------
+DRY_RUN=0
+ASSUME_YES=0
+FORCE=0
+METHOD="auto"
+DEV=""
+SANITIZE_TIMEOUT=$((60 * 60)) # seconds to wait for a hardware sanitize to finish
+LUKS_NAME="tinfoil_wipe"
+EXPECT_ZEROS=0   # set by a method that guarantees the device reads back as zeros
+_luks_opened=""  # mapper name to close on exit
+_keyfile=""      # throwaway key file to remove on exit
 
-if [ -z "$SSD" ]; then
-    echo "Error: No NVMe SSD specified."
-    echo "Usage: secure-wipe /dev/nvme0n1"
-    exit 1
-fi
+# --- output helpers -------------------------------------------------------
+log()  { printf ':: %s\n' "$*"; }
+info() { printf '   %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+err()  { printf 'ERROR: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
 
-if [ ! -b "$SSD" ]; then
-    echo "Error: $SSD is not a block device."
-    exit 1
-fi
+# run CMD...: echo the command; execute it unless --dry-run is set.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '   [dry-run] %s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
 
-# Ask for confirmation
-printf ":: This will securely wipe the data on %s.\n" "$SSD"
-printf " Are you sure? (y/n): "
-read -r confirmation
-if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
-    echo ":: Wipe cancelled."
-    exit 0
-fi
+cleanup() {
+  [ -n "$_luks_opened" ] && cryptsetup status "$_luks_opened" >/dev/null 2>&1 &&
+    cryptsetup close "$_luks_opened" >/dev/null 2>&1 || true
+  [ -n "$_keyfile" ] && [ -f "$_keyfile" ] && rm -f "$_keyfile" || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
-echo ":: Wiping $SSD..."
+# --- pure helpers (unit-tested in tests/) ---------------------------------
 
-# Use the Gutmann method
-gutmann_pattern=(
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff \
-  0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff
-)
+# region_is_zero PATH OFFSET_BYTES LENGTH_BYTES
+# Returns 0 when every byte in the sampled window is 0x00, 1 when a non-zero
+# byte is present, and 2 when the region could not be read. Replaces the
+# original `hexdump -C | grep -E '[^00]'`, which reported "non-zero" even for
+# perfectly zeroed input (the ASCII gutter and offset columns always contain
+# characters other than '0'). The read status is checked (pipefail propagates
+# a dd failure) so an unreadable device is never mistaken for a zeroed one.
+region_is_zero() {
+  local path=$1 off=$2 len=$3 nonzero
+  nonzero=$(
+    dd if="$path" bs=1M skip="$off" count="$len" \
+      iflag=skip_bytes,count_bytes,fullblock status=none 2>/dev/null |
+      LC_ALL=C tr -d '\000' | wc -c
+  ) || return 2
+  [ "$nonzero" -eq 0 ]
+}
 
-vol="luks_wipe"
-random_source="/dev/random"
+# nvme_controller DEV: map a namespace path to its controller char device,
+# e.g. /dev/nvme0n1 or /dev/nvme0n1p3 -> /dev/nvme0. Empty if not an NVMe node.
+nvme_controller() {
+  local dev=$1
+  [[ "$dev" =~ ^(/dev/nvme[0-9]+)n[0-9]+(p[0-9]+)?$ ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
 
-printf ":: Generating a random password..\n"
-random_password="$(head -c 512 < $random_source | tr -dc A-Za-z0-9)"
-printf ":: password: %s\n" "$random_password"
-printf ":: Creating LUKS2 encrypted volume on %s" "$SSD"
-cryptsetup luksFormat --type luks2 --hash sha512 --key-size 512 --iter-time 5000 "$SSD" <<EOF
-$random_password
-$random_password
-EOF
+# --- requirements ---------------------------------------------------------
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
 
-cryptsetup open "$SSD" "$vol" <<EOF
-$random_password
-EOF
-volPath="/dev/mapper/luks_wipe"
-printf ":: Wiping LUKS2 encrypted volume..\n"
-printf ":: Source: %s...\n" "$random_source\n:: "
+require_root() {
+  [ "$(id -u)" = "0" ] || die "$PROGNAME must be run as root"
+}
 
+# --- safety guards --------------------------------------------------------
 
+# device_in_use DEV: true if the device (or any of its partitions/holders)
+# is mounted or used as swap.
+device_in_use() {
+  local dev=$1
+  if lsblk -nro MOUNTPOINT "$dev" 2>/dev/null | grep -q '[^[:space:]]'; then
+    return 0
+  fi
+  local base
+  base=$(basename "$dev")
+  if grep -qE "^(/dev/)?${base}(p[0-9]+)? " /proc/swaps 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
 
-# Overwrite the disk multiple times with random data
-for i in $(seq 1 35); do
-  for byte in "${gutmann_pattern[@]}"; do
-  
-    printf ":: Gutmann iteration: %d/35" "$i"
-    dd if="$random_source" bs=12G count=1 seek="$byte" of="$volPath" conv=notrunc,noerror status=progress
+# is_root_disk DEV: true if DEV is the whole disk backing the mounted rootfs,
+# including stacked setups (LUKS, LVM) where the root source is a mapper node
+# and btrfs where SOURCE carries a [/subvol] suffix.
+is_root_disk() {
+  local dev=$1 rootsrc name type
+  rootsrc=$(findmnt -no SOURCE / 2>/dev/null) || return 1
+  rootsrc=${rootsrc%%[*} # strip a btrfs "[/@subvol]" suffix
+  [ -n "$rootsrc" ] || return 1
+  # Match $dev against every whole-disk ancestor of the root source, so RAID or
+  # LVM roots spanning several disks are all recognized. -r (raw) avoids the
+  # tree-drawing prefixes that -s adds in the NAME column.
+  while read -r name type; do
+    [ "$type" = "disk" ] && [ "/dev/$name" = "$dev" ] && return 0
+  done < <(lsblk -nrso NAME,TYPE "$rootsrc" 2>/dev/null)
+  return 1
+}
+
+# device_type DEV: lsblk TYPE (disk, part, crypt, lvm, ...); empty if unknown.
+device_type() { lsblk -dno TYPE "$1" 2>/dev/null | head -1; }
+
+# nvme_namespaces CTRL: list the namespace block-device nodes (nvmeXnY) of a
+# controller (nvmeX), excluding partitions.
+nvme_namespaces() {
+  local ctrl=$1 base n
+  base=$(basename "$ctrl")
+  shopt -s nullglob
+  for n in /dev/"${base}"n*; do
+    if [[ "$n" =~ ^/dev/${base}n[0-9]+$ ]]; then printf '%s\n' "$n"; fi
   done
-done
+  shopt -u nullglob
+}
 
+# controller_in_use CTRL: true if ANY namespace of the controller is mounted,
+# used as swap, or backs the root filesystem. NVMe Sanitize wipes every
+# namespace, so the whole controller must be clear, not just the target node.
+controller_in_use() {
+  local ctrl=$1 ns
+  while IFS= read -r ns; do
+    [ -n "$ns" ] || continue
+    if device_in_use "$ns" || is_root_disk "$ns"; then return 0; fi
+  done < <(nvme_namespaces "$ctrl")
+  return 1
+}
 
-echo ":: Closing LUKS2 encrypted volume"
-cryptsetup close $vol
+describe_device() {
+  local dev=$1
+  info "Device:  $dev"
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -dno NAME,SIZE,MODEL,SERIAL,TRAN "$dev" 2>/dev/null |
+      sed 's/^/   /' || true
+  fi
+}
 
-dd if=/dev/zero of="$SSD" bs=12G conv=notrunc,noerror status=progress
+confirm_destroy() {
+  local dev=$1 reply
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    return 0
+  fi
+  printf '\n'
+  warn "This PERMANENTLY destroys all data on $dev. There is no undo."
+  describe_device "$dev"
+  printf '\nType the full device path (%s) to confirm: ' "$dev"
+  read -r reply || reply=""
+  [ "$reply" = "$dev" ] || { log "Wipe cancelled."; exit 0; }
+}
 
+# --- wipe methods ---------------------------------------------------------
 
-# Verify the wiped data
-verify_result=$(dd if="$SSD" bs=12G count=1 | hexdump -C | grep -E '[^00]' | wc -l)
-if [ "$verify_result" -ne "0" ]; then
-  echo "Error: Data verification failed."
-  exit 1
-else
-  echo "$SSD securely wiped."
+# nvme_sanitize CTRL ACTION LABEL: issue an NVMe Sanitize and wait for it to
+# report completion. ACTION: 2=block erase, 4=crypto erase.
+nvme_sanitize() {
+  local ctrl=$1 action=$2 label=$3
+  log "NVMe Sanitize ($label) on $ctrl"
+  if ! run nvme sanitize "$ctrl" --sanact="$action"; then
+    warn "sanitize ($label) was rejected by the controller"
+    return 1
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return 0
+  fi
+  info "waiting for sanitize to complete (timeout ${SANITIZE_TIMEOUT}s)..."
+  local start=$SECONDS sstat status idle=0
+  while :; do
+    local log_json
+    log_json=$(nvme sanitize-log "$ctrl" -o json 2>/dev/null) || {
+      warn "cannot read sanitize-log; sanitize status is unverified"
+      return 1
+    }
+    sstat=$(printf '%s' "$log_json" | grep -o '"sstat"[^,}]*' | grep -o '[0-9]\+' | head -1)
+    if [ -n "$sstat" ]; then
+      status=$((sstat & 7))
+      case $status in
+        1 | 4) info "sanitize completed"; return 0 ;;
+        3) warn "sanitize reported failure (sstat=$sstat)"; return 1 ;;
+        2) idle=0 ;;                       # in progress
+        *) idle=$((idle + 1)) ;;           # idle/unknown
+      esac
+      # Never transitioned to "in progress" -> the drive ignored the command.
+      if [ "$idle" -ge 5 ]; then
+        warn "sanitize never started (sstat=$sstat)"
+        return 1
+      fi
+    fi
+    if (( SECONDS - start > SANITIZE_TIMEOUT )); then
+      warn "timed out waiting for sanitize after ${SANITIZE_TIMEOUT}s"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# nvme_format DEV SES LABEL: SES 1=user-data erase, 2=cryptographic erase.
+nvme_format() {
+  local dev=$1 ses=$2 label=$3
+  log "NVMe Format ($label) on $dev"
+  run nvme format "$dev" --ses="$ses" --force
+}
+
+# overwrite_zeros TARGET: write zeros across the whole block device exactly
+# once. Prefers blkdiscard -z; the dd fallback is bounded to the device size
+# (iflag=count_bytes) so any non-zero exit is a real I/O error and is fatal,
+# rather than being mistaken for the expected end-of-device ENOSPC.
+overwrite_zeros() {
+  local target=$1 size
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] blkdiscard -z $target  (fallback: dd if=/dev/zero count=<size>)"
+    return 0
+  fi
+  size=$(blockdev --getsize64 "$target") || die "cannot determine size of $target"
+  if ! blkdiscard -z "$target" 2>/dev/null; then
+    info "blkdiscard -z failed or unavailable; writing zeros with dd"
+    dd if=/dev/zero of="$target" bs=64M iflag=count_bytes count="$size" \
+      conv=fdatasync status=progress || die "zero-overwrite of $target failed"
+  fi
+}
+
+# crypto_erase DEV: software fallback. Encrypt the whole device with a
+# throwaway key, overwrite the entire mapping so previous plaintext in the
+# visible capacity is replaced, then destroy the LUKS header. The key
+# destruction is what makes the volume unrecoverable.
+crypto_erase() {
+  local dev=$1 mapper="/dev/mapper/$LUKS_NAME" keyfile
+  require_cmd cryptsetup
+  require_cmd blockdev
+  log "Software crypto-erase on $dev (LUKS2, throwaway key)"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    keyfile="<throwaway-key>"
+    info "[dry-run] create throwaway random key file (512 bytes from /dev/urandom)"
+  else
+    _keyfile=$(mktemp "${XDG_RUNTIME_DIR:-/dev/shm}/tinfoil.XXXXXX" 2>/dev/null ||
+      mktemp)
+    keyfile="$_keyfile"
+    # Raw random bytes as the key; not printed, and removed on exit.
+    dd if=/dev/urandom of="$_keyfile" bs=512 count=1 status=none
+  fi
+
+  run cryptsetup luksFormat --type luks2 --batch-mode \
+    --hash sha512 --key-size 512 --pbkdf argon2id \
+    --key-file "$keyfile" "$dev"
+  run cryptsetup open --key-file "$keyfile" "$dev" "$LUKS_NAME"
+  [ "$DRY_RUN" -eq 1 ] || _luks_opened="$LUKS_NAME"
+
+  log "Overwriting mapped volume once"
+  overwrite_zeros "$mapper"
+
+  run cryptsetup close "$LUKS_NAME"
+  [ "$DRY_RUN" -eq 1 ] || _luks_opened=""
+
+  log "Erasing LUKS header (discards the encryption key)"
+  run cryptsetup luksErase --batch-mode "$dev" ||
+    die "failed to erase the LUKS header; the key may still exist on $dev"
+  run wipefs -a "$dev" 2>/dev/null || true
+  run blkdiscard "$dev" 2>/dev/null || true
+}
+
+# zero_device DEV: fastest option. Ask the SSD to zero every block.
+zero_device() {
+  local dev=$1
+  require_cmd blockdev
+  EXPECT_ZEROS=1
+  log "Zeroing $dev"
+  overwrite_zeros "$dev"
+}
+
+# --- verification ---------------------------------------------------------
+
+# verify_zero DEV: sample several regions and confirm they read back as zero.
+# Returns 0 if all sampled regions are zero, 1 if any non-zero (or unreadable)
+# region is found, and 2 if the device size is unknown (cannot verify).
+# Meaningful only after a zeroing method.
+verify_zero() {
+  local dev=$1 size sample=$((1024 * 1024)) off failures=0
+  size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+  if [ "$size" -le 0 ]; then
+    warn "could not determine device size; cannot verify"
+    return 2
+  fi
+  local -a offsets=(0 $((size / 4)) $((size / 2)) $((size * 3 / 4)))
+  offsets+=($((size > sample ? size - sample : 0)))
+  log "Verifying zeroed regions"
+  for off in "${offsets[@]}"; do
+    local len=$sample r
+    (( off + len > size )) && len=$((size - off))
+    region_is_zero "$dev" "$off" "$len"; r=$?
+    case $r in
+      0) info "offset $off: zero" ;;
+      2) warn "offset $off: could not read"; failures=$((failures + 1)) ;;
+      *) warn "offset $off: NON-ZERO data present"; failures=$((failures + 1)) ;;
+    esac
+  done
+  [ "$failures" -eq 0 ]
+}
+
+# --- method selection -----------------------------------------------------
+
+run_auto() {
+  local dev=$1 ctrl
+  if ctrl=$(nvme_controller "$dev") && command -v nvme >/dev/null 2>&1; then
+    nvme_sanitize "$ctrl" 4 "crypto erase" && return 0
+    nvme_sanitize "$ctrl" 2 "block erase" && return 0
+    nvme_format "$dev" 2 "crypto erase" && return 0
+    nvme_format "$dev" 1 "user-data erase" && return 0
+    warn "no NVMe hardware erase succeeded; falling back to software crypto-erase"
+  else
+    info "nvme-cli or NVMe device not available; using software crypto-erase"
+  fi
+  crypto_erase "$dev"
+}
+
+dispatch() {
+  local dev=$1 ctrl
+  case "$METHOD" in
+    auto) run_auto "$dev" ;;
+    sanitize)
+      ctrl=$(nvme_controller "$dev") || die "sanitize requires an NVMe device"
+      require_cmd nvme
+      nvme_sanitize "$ctrl" 4 "crypto erase" ||
+        nvme_sanitize "$ctrl" 2 "block erase" ||
+        die "NVMe sanitize failed"
+      ;;
+    sanitize-block)
+      ctrl=$(nvme_controller "$dev") || die "sanitize requires an NVMe device"
+      require_cmd nvme
+      nvme_sanitize "$ctrl" 2 "block erase" || die "NVMe sanitize failed"
+      ;;
+    format-crypto)
+      require_cmd nvme
+      nvme_format "$dev" 2 "crypto erase" || die "NVMe format failed"
+      ;;
+    format-user)
+      require_cmd nvme
+      nvme_format "$dev" 1 "user-data erase" || die "NVMe format failed"
+      ;;
+    crypto) crypto_erase "$dev" ;;
+    zero) zero_device "$dev" ;;
+    *) die "unknown method: $METHOD" ;;
+  esac
+}
+
+# report_sample DEV: advisory, never fails. States whether the device reads
+# back as zeros. Used after methods that do not guarantee zeros (crypto/format/
+# sanitize), where non-zero data is expected rather than an error.
+report_sample() {
+  local dev=$1
+  if region_is_zero "$dev" 0 $((1024 * 1024)); then
+    info "sample at offset 0: reads back as zeros"
+  else
+    info "sample at offset 0: reads back as non-zero (expected after crypto/format erase)"
+  fi
+}
+
+# --- cli ------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+$PROGNAME $VERSION - securely erase an NVMe SSD
+
+Usage: $PROGNAME [options] /dev/nvmeXnY
+
+Options:
+  -m, --method M   erase method (default: auto)
+                     auto           hardware sanitize -> format -> software
+                     sanitize       NVMe Sanitize (crypto, else block erase)
+                     sanitize-block NVMe Sanitize (block erase)
+                     format-crypto  NVMe Format, cryptographic erase (namespace, or all on FNA drives)
+                     format-user    NVMe Format, user-data erase (namespace, or all on FNA drives)
+                     crypto         software LUKS2 crypto-erase (no nvme-cli)
+                     zero           blkdiscard -z / dd zero (weakest)
+  -y, --yes        skip the interactive confirmation (for automation)
+  -n, --dry-run    print the commands that would run; change nothing
+  -f, --force      allow a mounted or root-backing device (dangerous)
+  -t, --timeout S  seconds to wait for a hardware sanitize (default: $SANITIZE_TIMEOUT)
+  -h, --help       show this help
+  -V, --version    show version
+
+Secure erase on flash media is a controller operation. Multi-pass overwrite
+(e.g. the Gutmann method) does not reliably reach cells hidden by the SSD's
+wear-leveling layer; NVMe Sanitize / Format do. See NIST SP 800-88 Rev. 1.
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m | --method)
+        [ $# -ge 2 ] || die "$1 requires a value (see --help)"
+        METHOD="$2"; shift 2 ;;
+      -t | --timeout)
+        [ $# -ge 2 ] || die "$1 requires a value (see --help)"
+        case "$2" in "" | *[!0-9]*) die "--timeout requires a positive integer (seconds)" ;; esac
+        SANITIZE_TIMEOUT="$2"; shift 2 ;;
+      -y | --yes) ASSUME_YES=1; shift ;;
+      -n | --dry-run) DRY_RUN=1; shift ;;
+      -f | --force) FORCE=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -V | --version) printf '%s %s\n' "$PROGNAME" "$VERSION"; exit 0 ;;
+      --)
+        shift
+        if [ $# -gt 0 ]; then
+          [ -z "$DEV" ] || die "unexpected argument: $1"
+          DEV="$1"; shift
+          [ $# -eq 0 ] || die "unexpected argument: $1"
+        fi
+        break ;;
+      -*) die "unknown option: $1 (see --help)" ;;
+      *) [ -z "$DEV" ] || die "unexpected argument: $1"; DEV="$1"; shift ;;
+    esac
+  done
+  case "$METHOD" in
+    auto | sanitize | sanitize-block | format-crypto | format-user | crypto | zero) ;;
+    *) die "unknown method: $METHOD (see --help)" ;;
+  esac
+  [ -n "$DEV" ] || { usage >&2; exit 1; }
+}
+
+main() {
+  local dev dtype ctrl="" rc
+  parse_args "$@"
+
+  [ "$DRY_RUN" -eq 1 ] || require_root  # dry-run changes nothing; allow preview as any user
+  require_cmd dd
+  require_cmd lsblk
+
+  [ -e "$DEV" ] || die "$DEV does not exist"
+  dev=$(readlink -f -- "$DEV") || die "cannot resolve $DEV"
+  [ -b "$dev" ] || die "$dev is not a block device"
+  dtype=$(device_type "$dev") || dtype="" # lsblk fails on odd nodes; treat as unknown
+
+  # NVMe hardware erase acts on a whole namespace/controller, never a single
+  # partition. Reject partitions there so pointing at a spare partition cannot
+  # silently wipe the entire drive (and root with it).
+  case "$METHOD" in
+    sanitize | sanitize-block | format-crypto | format-user)
+      [ "$dtype" = "disk" ] ||
+        die "$METHOD erases a whole NVMe namespace, but $dev is a ${dtype:-non-disk} node; pass the namespace (e.g. /dev/nvme0n1)"
+      ;;
+    auto)
+      [ "$dtype" = "disk" ] ||
+        die "$dev is a ${dtype:-non-disk} node; 'auto' may erase the whole drive via NVMe sanitize. To wipe only this partition use -m crypto or -m zero; to erase the drive pass the whole namespace/disk"
+      ;;
+  esac
+
+  # NVMe hardware methods act on the controller: Sanitize erases every
+  # namespace, and Format erases every namespace on drives whose FNA field sets
+  # the relevant bit. Resolve the controller so the whole-controller in-use
+  # guard applies to all of them, not just the named node.
+  case "$METHOD" in
+    auto | sanitize | sanitize-block | format-crypto | format-user)
+      ctrl=$(nvme_controller "$dev" || true) ;;
+  esac
+
+  # A hardware erase needs an actual NVMe device; refuse before the prompt.
+  case "$METHOD" in
+    sanitize | sanitize-block | format-crypto | format-user)
+      [ -n "$ctrl" ] || die "$METHOD requires an NVMe device; $dev is not an NVMe namespace"
+      ;;
+  esac
+
+  if [ -n "$ctrl" ]; then
+    if controller_in_use "$ctrl"; then
+      [ "$FORCE" -eq 1 ] ||
+        die "a namespace on controller $ctrl is mounted, swap, or the root disk; this erase can affect the ENTIRE controller. Refusing without --force"
+      warn "controller $ctrl has a namespace in use; continuing because --force was given"
+    fi
+  else
+    if device_in_use "$dev"; then
+      [ "$FORCE" -eq 1 ] || die "$dev (or a partition) is mounted or in use as swap; refusing without --force"
+      warn "$dev is in use; continuing because --force was given"
+    fi
+    if is_root_disk "$dev"; then
+      [ "$FORCE" -eq 1 ] || die "$dev backs the running root filesystem; refusing without --force"
+      warn "$dev backs the root filesystem; continuing because --force was given"
+    fi
+  fi
+
+  local mode="$METHOD"; [ "$DRY_RUN" -eq 1 ] && mode="$METHOD, dry-run"
+  log "Target: $dev  (method: $mode)"
+  if [ -n "$ctrl" ]; then
+    case "$METHOD" in
+      sanitize | sanitize-block)
+        warn "NVMe Sanitize erases the ENTIRE controller $ctrl (every namespace below), not just $dev:" ;;
+      format-crypto | format-user)
+        warn "NVMe Format can erase every namespace on controller $ctrl (drive-dependent, per the FNA field), not just $dev:" ;;
+      *)
+        warn "This may erase the ENTIRE controller $ctrl (every namespace below), not just $dev:" ;;
+    esac
+    nvme_namespaces "$ctrl" | sed 's/^/     /'
+  fi
+  confirm_destroy "$dev"
+
+  dispatch "$dev"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Dry run complete; nothing was changed."
+    return 0
+  fi
+
+  if [ "$EXPECT_ZEROS" -eq 1 ]; then
+    if verify_zero "$dev"; then
+      log "$dev securely wiped and verified."
+    else
+      rc=$?
+      if [ "$rc" -eq 2 ]; then
+        log "$dev wiped (verification skipped: could not sample the device)."
+      else
+        die "$dev wiped, but verification found non-zero data (see warnings above)"
+      fi
+    fi
+  else
+    log "$dev wiped via $METHOD (encryption key destroyed / data erased)."
+    report_sample "$dev"
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
+  main "$@"
 fi
-
